@@ -112,7 +112,7 @@ jobs:
           y = np.eye(num_classes, dtype="float32")[
               np.asarray([0, 1, 0, 1], dtype="int32")
           ]
-          inference_mode = np.asarray(0.0, dtype="float64")
+          inference_mode = np.asarray(0.0, dtype="float32")
 
           pi = model.draw_pi(x, inference_mode)
           predicted_one_hot = model.predict_label(x, inference_mode)
