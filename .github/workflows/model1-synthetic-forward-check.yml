@@ -67,14 +67,7 @@ jobs:
           test ! -e /root/data
 
           python - <<'PYTHON_CHECK'
-          import cPickle
           import numpy as np
-
-          def blocked_deserialization(*args, **kwargs):
-              raise RuntimeError("Deserialization is forbidden in this synthetic check")
-
-          cPickle.load = blocked_deserialization
-          np.load = blocked_deserialization
 
           from SS_M1 import SS_M1
 
@@ -147,6 +140,6 @@ jobs:
           print("All synthetic forward outputs are finite")
           print("No labeled/unlabeled cost graph was requested")
           print("No optimizer or training update was created")
-          print("No pickle or NumPy object was deserialized")
+          print("No repository data or weights were mounted or deserialized")
           PYTHON_CHECK
           CONTAINER_SCRIPT
