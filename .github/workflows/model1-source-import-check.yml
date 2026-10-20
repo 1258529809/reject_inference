@@ -1,0 +1,105 @@
+name: Model 1 source import check
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - codex/model1-cpu-env-check
+    paths:
+      - .github/workflows/model1-source-import-check.yml
+
+permissions:
+  contents: read
+
+jobs:
+  source-import-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Sparse checkout Model 1 source only
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+          sparse-checkout: |
+            python/model1
+          sparse-checkout-cone-mode: false
+
+      - name: Verify checkout scope
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -d python/model1
+          test ! -e data
+          test ! -e output
+          find python/model1 -maxdepth 1 -type f -printf '%f\n' | sort
+
+      - name: Pull pinned author image
+        shell: bash
+        env:
+          IMAGE: rogelioandrade/theano_setup@sha256:69c334b33ae5df566d8f17363428bb5a7030743f7bcc7ba27ab29e616f7b848f
+        run: |
+          set -euo pipefail
+          docker pull "${IMAGE}"
+
+      - name: Import original Model 1 modules without data access
+        shell: bash
+        env:
+          IMAGE: rogelioandrade/theano_setup@sha256:69c334b33ae5df566d8f17363428bb5a7030743f7bcc7ba27ab29e616f7b848f
+        run: |
+          set -euo pipefail
+          docker run --rm -i \
+            --network none \
+            --cpus 2 \
+            --memory 8g \
+            --pids-limit 512 \
+            --security-opt=no-new-privileges:true \
+            --read-only \
+            --tmpfs /tmp:rw,noexec,nosuid,size=512m \
+            -e HOME=/tmp \
+            -e PYTHONDONTWRITEBYTECODE=1 \
+            -e THEANO_FLAGS=device=cpu,floatX=float32,base_compiledir=/tmp/theano \
+            -v "${GITHUB_WORKSPACE}/python/model1:/work/model1:ro" \
+            -w /work/model1 \
+            "${IMAGE}" /bin/bash -s <<'CONTAINER_SCRIPT'
+          set -eu
+          test ! -e /work/data
+          test ! -e /root/data
+
+          python - <<'PYTHON_CHECK'
+          import cPickle
+          import numpy as np
+
+          def blocked_deserialization(*args, **kwargs):
+              raise RuntimeError("Deserialization is forbidden in this import-only check")
+
+          cPickle.load = blocked_deserialization
+          np.load = blocked_deserialization
+
+          import utils
+          print("utils import: OK")
+
+          import dropout_layers
+          print("dropout_layers import: OK")
+
+          import SS_M1
+          print("SS_M1 import: OK")
+
+          import training_model1
+          print("training_model1 import without main(): OK")
+
+          assert hasattr(dropout_layers, "CLS")
+          assert hasattr(dropout_layers, "GaussianMLP")
+          assert hasattr(dropout_layers, "BernoulliMLP")
+          assert hasattr(SS_M1, "SS_M1")
+          assert callable(training_model1.main)
+
+          print("Classifier symbol CLS: OK")
+          print("Encoder/prior/decoder building block GaussianMLP: OK")
+          print("Decoder building block BernoulliMLP: OK")
+          print("Model class SS_M1: OK")
+          print("No model object instantiated")
+          print("No pickle or NumPy object deserialized")
+          PYTHON_CHECK
+          CONTAINER_SCRIPT
