@@ -1,0 +1,89 @@
+name: Model 1 CPU environment check
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - codex/model1-cpu-env-check
+    paths:
+      - .github/workflows/model1-cpu-env-check.yml
+
+permissions:
+  contents: read
+
+jobs:
+  cpu-environment-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Report runner resources
+        shell: bash
+        run: |
+          set -euo pipefail
+          uname -a
+          lscpu
+          free -h
+          df -h /
+
+      - name: Pull pinned author image
+        shell: bash
+        env:
+          IMAGE: rogelioandrade/theano_setup@sha256:69c334b33ae5df566d8f17363428bb5a7030743f7bcc7ba27ab29e616f7b848f
+        run: |
+          set -euo pipefail
+          docker pull "${IMAGE}"
+          docker image inspect "${IMAGE}" --format 'RepoDigests={{json .RepoDigests}}'
+          docker image inspect "${IMAGE}" --format 'Architecture={{.Architecture}} OS={{.Os}} SizeBytes={{.Size}}'
+
+      - name: Check original Python 2, Theano, and R stack in CPU mode
+        shell: bash
+        env:
+          IMAGE: rogelioandrade/theano_setup@sha256:69c334b33ae5df566d8f17363428bb5a7030743f7bcc7ba27ab29e616f7b848f
+        run: |
+          set -euo pipefail
+          docker run --rm -i \
+            --network none \
+            --cpus 2 \
+            --memory 8g \
+            --pids-limit 512 \
+            --security-opt=no-new-privileges:true \
+            -e THEANO_FLAGS=device=cpu,floatX=float32 \
+            "${IMAGE}" /bin/bash -s <<'CONTAINER_SCRIPT'
+          set -eu
+
+          python - <<'PYTHON_CHECK'
+          import sys
+          import numpy as np
+          import scipy
+          import sklearn
+          import matplotlib
+          import theano
+          import theano.tensor as T
+          from rpy2.robjects.packages import importr
+
+          print("Python: {}".format(sys.version.replace("\n", " ")))
+          print("NumPy: {}".format(np.__version__))
+          print("SciPy: {}".format(scipy.__version__))
+          print("scikit-learn: {}".format(sklearn.__version__))
+          print("Matplotlib: {}".format(matplotlib.__version__))
+          print("Theano: {}".format(getattr(theano, "__version__", "unknown")))
+          print("Theano device: {}".format(theano.config.device))
+          print("Theano floatX: {}".format(theano.config.floatX))
+
+          assert str(theano.config.device) == "cpu"
+          assert str(theano.config.floatX) == "float32"
+
+          x = T.vector("x")
+          compiled = theano.function([x], x + np.float32(1.0))
+          result = compiled(np.asarray([1.0, 2.0], dtype="float32"))
+          assert np.allclose(result, np.asarray([2.0, 3.0], dtype="float32"))
+          print("Theano CPU compile/execute: OK ({})".format(result))
+
+          importr("hmeasure")
+          print("rpy2 + R hmeasure import: OK")
+          PYTHON_CHECK
+
+          R --version | head -n 1
+          Rscript -e 'library(hmeasure); cat("R hmeasure load: OK\n")'
+          CONTAINER_SCRIPT
