@@ -49,7 +49,7 @@ jobs:
             ffe372541611db4a66504fc49186401aef642123
           test "$(stat -c '%s' -- data/supervised_lc_paper.pk.gz)" = 854027
           test "$(stat -c '%s' -- data/unsupervised_lc_paper.pk.gz)" = 3011684
-          echo \
+          printf '%s\n' \
             '2492824dc943e67ee6777895dfa4d30caea8cce8b94d13814f7965dc9df0a187  data/supervised_lc_paper.pk.gz' \
             'a5ef7158dd561917b09d8d714b1b7137cbc3625cd2d268a4a153f5e018620a75  data/unsupervised_lc_paper.pk.gz' \
             | sha256sum --check --strict
