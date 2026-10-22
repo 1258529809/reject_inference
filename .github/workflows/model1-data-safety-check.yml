@@ -313,7 +313,7 @@ jobs:
             --cap-drop ALL \
             --security-opt no-new-privileges:true \
             --read-only \
-            --tmpfs /tmp:rw,nosuid,size=512m \
+            --tmpfs /tmp:rw,exec,nosuid,size=512m \
             -e HOME=/tmp \
             -e PYTHONDONTWRITEBYTECODE=1 \
             -e THEANO_FLAGS=device=cpu,floatX=float32,base_compiledir=/tmp/theano \
