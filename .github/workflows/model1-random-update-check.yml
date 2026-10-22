@@ -168,6 +168,18 @@ jobs:
                   for item in flat
               ]
 
+          def gradients_in_flat_order(model, gradients, flat):
+              by_parameter_id = dict([
+                  (id(parameter), gradient)
+                  for parameter, gradient in zip(model.params, gradients)
+              ])
+              ordered = [
+                  by_parameter_id[id(item[2])]
+                  for item in flat
+              ]
+              assert len(ordered) == 26
+              return ordered
+
           def scalar_value(value):
               array = np.asarray(value)
               assert array.shape == ()
@@ -487,6 +499,11 @@ jobs:
               T.sum(T.square(gradient))
               for gradient in labeled_model.gparams_l
           ]))
+          labeled_report_gradients = gradients_in_flat_order(
+              labeled_model,
+              labeled_model.gparams_l,
+              labeled_flat,
+          )
           labeled_monitor_fn = theano.function(
               inputs=[
                   labeled_model.x,
@@ -498,7 +515,7 @@ jobs:
               ],
               outputs=(
                   [labeled_model.labeled_cost]
-                  + labeled_model.gparams_l
+                  + labeled_report_gradients
                   + [labeled_used_norm, labeled_used_norm]
               ),
               no_default_updates=True,
@@ -567,6 +584,11 @@ jobs:
               T.sum(T.square(gradient))
               for gradient in unlabeled_raw_gradients
           ]))
+          unlabeled_report_gradients = gradients_in_flat_order(
+              unlabeled_model,
+              unlabeled_model.gparams_u,
+              unlabeled_flat,
+          )
           unlabeled_monitor_fn = theano.function(
               inputs=[
                   unlabeled_model.x,
@@ -575,7 +597,7 @@ jobs:
               ],
               outputs=(
                   [unlabeled_model.unlabeled_cost]
-                  + unlabeled_model.gparams_u
+                  + unlabeled_report_gradients
                   + [unlabeled_used_norm, unlabeled_raw_norm]
               ),
               no_default_updates=True,
