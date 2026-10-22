@@ -240,7 +240,7 @@ jobs:
           supervised_path = '/data/supervised_lc_paper.pk.gz'
           unsupervised_path = '/data/unsupervised_lc_paper.pk.gz'
           supervised = validate_mapping(supervised_path, ['accepted_flg', 'data', 'labels'])
-          unsupervised = validate_mapping(unsupervised_path, ['data'])
+          unsupervised = validate_mapping(unsupervised_path, ['accepted_flg', 'data'])
 
           for name, mapping in [('SUPERVISED', supervised), ('UNSUPERVISED', unsupervised)]:
               print('{}_KEYS={}'.format(name, sorted(mapping.keys())))
@@ -255,6 +255,13 @@ jobs:
               print('{}_FEATURE_COLUMNS={}'.format(name, data.shape[1] - 1))
               print('{}_DATE_MIN={}'.format(name, dates.min()))
               print('{}_DATE_MAX={}'.format(name, dates.max()))
+              accepted_flg = mapping['accepted_flg']
+              if accepted_flg.ndim not in (1, 2) or accepted_flg.shape[0] != data.shape[0]:
+                  raise ValueError('{} accepted_flg must align with data'.format(name))
+              array_stats('{}_ACCEPTED_FLG'.format(name), accepted_flg)
+              accepted_values, accepted_counts = np.unique(accepted_flg, return_counts=True)
+              print('{}_ACCEPTED_FLAG_VALUES={}'.format(name, accepted_values.tolist()))
+              print('{}_ACCEPTED_FLAG_COUNTS={}'.format(name, accepted_counts.tolist()))
 
           labels = supervised['labels']
           if labels.ndim != 2 or labels.shape[0] != supervised['data'].shape[0] or labels.shape[1] < 1:
@@ -265,13 +272,6 @@ jobs:
           print('PRIMARY_LABEL_COUNTS={}'.format(counts.tolist()))
           print('PRIMARY_LABEL_CLASS_COUNT={}'.format(values.size))
 
-          accepted_flg = supervised['accepted_flg']
-          if accepted_flg.ndim not in (1, 2) or accepted_flg.shape[0] != supervised['data'].shape[0]:
-              raise ValueError('accepted_flg must be a vector or matrix aligned with supervised data')
-          array_stats('SUPERVISED_ACCEPTED_FLG', accepted_flg)
-          accepted_values, accepted_counts = np.unique(accepted_flg, return_counts=True)
-          print('ACCEPTED_FLAG_VALUES={}'.format(accepted_values.tolist()))
-          print('ACCEPTED_FLAG_COUNTS={}'.format(accepted_counts.tolist()))
           if not np.array_equal(values, np.asarray([0, 1], dtype=values.dtype)):
               raise ValueError('Primary labels are not exactly binary 0/1')
           print('DATA_CONTRACT=PASS')
