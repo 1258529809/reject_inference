@@ -90,5 +90,57 @@ The workflow `.github/workflows/model1-data-safety-check.yml`:
 6. only after the gate passes, uses a restricted unpickler in a non-root, no-network, read-only, resource-limited container;
 7. emits aggregate schema/statistics only and never prints customer records.
 
-The security and aggregate results will be appended after the isolated workflow has completed.
+## Stage 8 verified results
+
+Workflow run: [39771806324](https://github.com/1258529809/reject_inference/actions/runs/39771806324), source commit `20a2ae847341b6a875a317dee8ef422b46ab1090`.
+
+### File identity and provenance
+
+| File | Compressed bytes | Git blob SHA-1 | SHA-256 | SHA-512 |
+|---|---:|---|---|---|
+| `data/supervised_lc_paper.pk.gz` | 854,027 | `63e87ab586d25f6109310eb71206267d6897c739` | `2492824dc943e67ee6777895dfa4d30caea8cce8b94d13814f7965dc9df0a187` | `240023d43257cfdcc4994d566a7ba35a68bab21f04067f523d3cd37a7cff41ed011acf63ccc6ffc89e4f9aaf38c35a93e5765e30e4eb800f069c91196a2c5ca4` |
+| `data/unsupervised_lc_paper.pk.gz` | 3,011,684 | `ffe372541611db4a66504fc49186401aef642123` | `a5ef7158dd561917b09d8d714b1b7137cbc3625cd2d268a4a153f5e018620a75` | `c27dfd8d5e7005b36d989d5ce17c71df7ab269739a98c333d2bd991db0655e103c07edb80dd0e822bc055557c73dd94a06026adbd91de8f9ae9870a517cabd01` |
+
+Both files have gzip magic `1f8b` and passed `gzip -t`. Their uncompressed pickle sizes are 7,158,284 and 21,458,598 bytes. Git history contains one unsigned introduction commit, `2061e614452a09e8336e7a8c8462fa50f4d92fda`, authored by `rogelioandrade` on 2021-09-24. This verifies repository history and byte identity, but does not independently authenticate the original Lending Club extraction.
+
+### Static safety gate and isolated parsing
+
+- Both streams referenced only `numpy.core.multiarray._reconstruct`, `numpy.ndarray`, and `numpy.dtype`.
+- Supervised: 5 `REDUCE`, 5 `BUILD`; unsupervised: 4 `REDUCE`, 4 `BUILD`.
+- Forbidden construction/persistence opcodes: none. Unexpected globals: none. Trailing bytes after `STOP`: none.
+- Controlled parsing used an exact-global restricted unpickler in a network-disabled, non-root container with read-only data/root filesystems, dropped capabilities, `no-new-privileges`, 2 CPUs, 2 GiB memory, 64 PIDs, and a `noexec` temporary filesystem.
+- The allowlist was not broadened after schema discovery. Exact keys are supervised `accepted_flg`, `data`, `labels`; unsupervised `accepted_flg`, `data`.
+
+### Aggregate data contract
+
+| Item | Supervised/accepted file | Unsupervised/rejected file |
+|---|---:|---:|
+| Rows | 149,125 | 536,459 |
+| `data` | `(149125, 8)`, float32 | `(536459, 8)`, float32 |
+| Feature columns excluding date | 7 | 7 |
+| Encoded date range | 20090100–20131200 | 20090100–20120930 |
+| `accepted_flg` | `(149125, 2)`, float32 | `(536459, 2)`, float32 |
+| NaN / Inf in `data` | 0 / 0 | 0 / 0 |
+| NaN / Inf in `accepted_flg` | 0 / 0 | 0 / 0 |
+
+For each two-column `accepted_flg`, flattened values are exactly 0 and 1, each occurring once per row (149,125 each or 536,459 each). Supervised `labels` is `(149125, 2)` float32 with no NaN/Inf; its first column has values 0/1 with counts 131,115/18,010 (two classes). No customer-level records were printed or uploaded.
+
+### Compiled schedule behavior
+
+The data-free probe uses `/tmp/theano` on an explicitly executable tmpfs, matching the compilation arrangement used by the successful Stage 3–6 workflows. Inputs and random seed are fixed and evaluation uses inference mode.
+
+| Check | Before/controls | After Python-side schedule call | Result |
+|---|---:|---:|---|
+| Adam learning rate | compiled at `0.0001`: parameter delta `0.000100016593933`; precompile `0.5` control delta `0.499994158745` | `optimizer.lr` became `0.5`, but compiled-function delta remained `0.000100016593933` | Post-compile `learning_decay()` does not alter the compiled update step |
+| Alpha | compiled with `12.0847615979`; labeled loss `15.6555790817` | `model.alpha` became `1.02523253766`; loss remained `15.6555790817` | Post-compile `alpha_annealing()` does not alter the compiled loss |
+
+These checks establish compiled-graph behavior, not mathematical correctness or paper-result reproduction.
+
+## Training blockers before any real run
+
+1. Decide explicitly whether to run the public source baseline (`zdim=10`, no VAE pretraining) or implement the separate paper protocol (`zdim=50`, VAE pretraining); do not mix them.
+2. The public VAE path is incomplete because `VAE.py` imports missing `mlp.py`.
+3. The README command must explicitly pass `--dset paper`; the source default `cards` is unsupported. If passing `--batch_size`, argparse leaves a command-line value as a string because no `type=int` is declared.
+4. Treat learning-rate decay and alpha annealing as ineffective after graph compilation unless a separately approved compatibility change is designed; the source-baseline route must record this behavior rather than silently fix it.
+5. Record/fix seeds before claiming repeatability, and separately resolve preprocessing leakage, rejected-split use, repeated-holdout-versus-K-fold behavior, and beta calibration for a paper-protocol experiment.
 
