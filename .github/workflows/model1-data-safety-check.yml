@@ -394,6 +394,7 @@ jobs:
               ],
               outputs=model.labeled_cost,
               no_default_updates=True,
+              on_unused_input='ignore',
           )
 
           rng = np.random.RandomState(808)
