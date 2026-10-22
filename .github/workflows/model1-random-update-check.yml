@@ -330,6 +330,7 @@ jobs:
           ):
               initial = snapshot(flat)
               previous_after_loss = scalar_value(loss_fn(*loss_args))
+              initial_loss = previous_after_loss
               print(
                   "UPDATE_INITIAL path={} loss={:.17g} parameter_count=26 "
                   "all_parameters_finite=True".format(
@@ -426,9 +427,7 @@ jobs:
                   "all_parameters_updated=True all_finite=True".format(
                       path_name,
                       previous_after_loss,
-                      previous_after_loss - scalar_value(
-                          loss_fn(*loss_args)
-                      ) + 0.0,
+                      previous_after_loss - initial_loss,
                   )
               )
 
