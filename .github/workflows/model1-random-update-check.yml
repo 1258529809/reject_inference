@@ -1,0 +1,611 @@
+name: Model 1 random parameter update check
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - codex/model1-cpu-env-check
+    paths:
+      - .github/workflows/model1-random-update-check.yml
+
+permissions:
+  contents: read
+
+jobs:
+  random-update-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+
+    steps:
+      - name: Sparse checkout Model 1 source only
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+          sparse-checkout: |
+            python/model1
+          sparse-checkout-cone-mode: false
+
+      - name: Verify isolated checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -d python/model1
+          test ! -e data
+          test ! -e output
+          echo "workflow_commit=$(git rev-parse HEAD)"
+          sha256sum \
+            python/model1/SS_M1.py \
+            python/model1/dropout_layers.py \
+            python/model1/optimizers.py \
+            python/model1/training_model1.py \
+            python/model1/utils.py
+
+      - name: Pull pinned author image
+        shell: bash
+        env:
+          IMAGE: rogelioandrade/theano_setup@sha256:69c334b33ae5df566d8f17363428bb5a7030743f7bcc7ba27ab29e616f7b848f
+        run: |
+          set -euo pipefail
+          docker pull "${IMAGE}"
+
+      - name: Execute three original Adam updates per path
+        shell: bash
+        env:
+          IMAGE: rogelioandrade/theano_setup@sha256:69c334b33ae5df566d8f17363428bb5a7030743f7bcc7ba27ab29e616f7b848f
+        run: |
+          set -euo pipefail
+          docker run --rm -i \
+            --network none \
+            --cpus 2 \
+            --memory 8g \
+            --pids-limit 512 \
+            --security-opt=no-new-privileges:true \
+            --read-only \
+            --tmpfs /tmp:rw,exec,nosuid,size=1g \
+            -e HOME=/tmp \
+            -e PYTHONDONTWRITEBYTECODE=1 \
+            -e OMP_NUM_THREADS=2 \
+            -e THEANO_FLAGS=device=cpu,floatX=float32,base_compiledir=/tmp/theano \
+            -v "${GITHUB_WORKSPACE}/python/model1:/work/model1:ro" \
+            -w /work/model1 \
+            "${IMAGE}" /bin/bash -s <<'CONTAINER_SCRIPT'
+          set -eu
+          test ! -e /work/data
+          test ! -e /work/output
+          test ! -e /work/model1/data
+          test ! -e /work/model1/output
+
+          python - <<'PYTHON_CHECK'
+          import numpy as np
+          import theano
+          import theano.tensor as T
+
+          from SS_M1 import SS_M1
+
+          class Args(object):
+              pass
+
+          def make_args():
+              args = Args()
+              args.lr_u = 0.0001
+              args.lr_l = 0.0001
+              args.batch_size = 4
+              args.hdim_cls = [5]
+              args.hdim_enc = [5]
+              args.hdim_dec = [5]
+              args.hdim_gmm = [5]
+              args.zdim = 3
+              args.dec = "gaussian"
+              args.num_k = 2
+              args.nlayers_enc = 1
+              args.nlayers_dec = 1
+              args.nlayers_cls = 1
+              args.nlayers_gmm = 1
+              args.dropout_rate = 0.01
+              args.hl_activation = "softplus"
+              return args
+
+          def make_model():
+              return SS_M1(
+                  xdim=6,
+                  num_classes=2,
+                  alpha=1.1,
+                  args=make_args(),
+                  enc_weights=None,
+                  dec_weights=None,
+                  cls_weights=None,
+                  gmm_weights=None,
+              )
+
+          PARAMETER_NAMES = {
+              "classifier": ["hidden_W", "hidden_b", "softmax_W", "softmax_b"],
+              "encoder": [
+                  "hidden_W", "hidden_b", "mu_W", "mu_b", "logvar_W", "logvar_b"
+              ],
+              "decoder": [
+                  "hidden_W", "hidden_b", "mu_W", "mu_b", "logvar_W", "logvar_b"
+              ],
+              "conditional_prior": [
+                  "shared_hidden_W", "shared_hidden_b",
+                  "class0_mu_W", "class0_mu_b", "class0_logvar_W", "class0_logvar_b",
+                  "class1_mu_W", "class1_mu_b", "class1_logvar_W", "class1_logvar_b",
+              ],
+          }
+
+          def parameter_groups(model):
+              groups = [
+                  ("classifier", list(model.cls_mlp.params)),
+                  ("encoder", list(model.enc_mlp.params)),
+                  ("decoder", list(model.dec_mlp.params)),
+                  ("conditional_prior", list(model.gmm_weights)),
+              ]
+              expected = {
+                  "classifier": 4,
+                  "encoder": 6,
+                  "decoder": 6,
+                  "conditional_prior": 10,
+              }
+              flat = []
+              for group_name, params in groups:
+                  assert len(params) == expected[group_name]
+                  for index, parameter in enumerate(params):
+                      flat.append((
+                          group_name,
+                          PARAMETER_NAMES[group_name][index],
+                          parameter,
+                      ))
+              assert len(flat) == 26
+              assert len(set([id(item[2]) for item in flat])) == 26
+              assert sorted([id(item[2]) for item in flat]) == sorted(
+                  [id(parameter) for parameter in model.params]
+              )
+              return groups, flat
+
+          def snapshot(flat):
+              return [
+                  np.array(item[2].get_value(borrow=True), copy=True)
+                  for item in flat
+              ]
+
+          def scalar_value(value):
+              array = np.asarray(value)
+              assert array.shape == ()
+              assert np.isfinite(array).all()
+              return float(array)
+
+          def inspect_updates(path_name, model, updates, learning_rate):
+              parameter_ids = set([id(parameter) for parameter in model.params])
+              parameter_targets = [
+                  target for target, expression in updates
+                  if id(target) in parameter_ids
+              ]
+              target_ids = [id(target) for target in parameter_targets]
+              assert len(model.params) == 26
+              assert len(updates) == 79
+              assert len(parameter_targets) == 26
+              assert len(set(target_ids)) == 26
+              assert set(target_ids) == parameter_ids
+              print(
+                  "OPTIMIZER path={} type={} learning_rate={} "
+                  "parameter_count={} update_tuple_count={} "
+                  "parameter_target_count={} all_parameters_targeted=True".format(
+                      path_name,
+                      type(model.optimizer_l if path_name == "labeled" else model.optimizer_u).__name__,
+                      learning_rate,
+                      len(model.params),
+                      len(updates),
+                      len(parameter_targets),
+                  )
+              )
+
+          def analyze_step(path_name, step, flat, before, after, gradients):
+              group_stats = {}
+              total_dot = 0.0
+              total_delta_sq = 0.0
+              total_grad_sq = 0.0
+              total_unchanged = 0
+
+              for index, item in enumerate(flat):
+                  group_name, parameter_name, parameter = item
+                  delta = after[index].astype("float64") - before[index].astype("float64")
+                  gradient = np.asarray(gradients[index]).astype("float64")
+                  assert delta.shape == gradient.shape
+                  assert np.isfinite(delta).all()
+                  assert np.isfinite(gradient).all()
+                  changed = not np.array_equal(after[index], before[index])
+                  total_unchanged += int(not changed)
+
+                  if group_name not in group_stats:
+                      group_stats[group_name] = {
+                          "delta_sq": 0.0,
+                          "grad_sq": 0.0,
+                          "dot": 0.0,
+                          "unchanged": 0,
+                          "count": 0,
+                      }
+                  stat = group_stats[group_name]
+                  stat["delta_sq"] += float(np.sum(delta * delta))
+                  stat["grad_sq"] += float(np.sum(gradient * gradient))
+                  stat["dot"] += float(np.sum(delta * gradient))
+                  stat["unchanged"] += int(not changed)
+                  stat["count"] += 1
+
+                  total_dot += float(np.sum(delta * gradient))
+                  total_delta_sq += float(np.sum(delta * delta))
+                  total_grad_sq += float(np.sum(gradient * gradient))
+
+              for group_name in [
+                  "classifier", "encoder", "decoder", "conditional_prior"
+              ]:
+                  stat = group_stats[group_name]
+                  delta_norm = float(np.sqrt(stat["delta_sq"]))
+                  grad_norm = float(np.sqrt(stat["grad_sq"]))
+                  if delta_norm > 0.0 and grad_norm > 0.0:
+                      descent_cosine = float(
+                          -stat["dot"] / (delta_norm * grad_norm)
+                      )
+                  else:
+                      descent_cosine = float("nan")
+                  print(
+                      "UPDATE_GROUP path={} step={} group={} count={} "
+                      "delta_norm={:.17g} used_grad_norm={:.17g} "
+                      "delta_dot_grad={:.17g} descent_cosine={:.17g} "
+                      "unchanged_count={} finite=True".format(
+                          path_name,
+                          step,
+                          group_name,
+                          stat["count"],
+                          delta_norm,
+                          grad_norm,
+                          stat["dot"],
+                          descent_cosine,
+                          stat["unchanged"],
+                      )
+                  )
+
+              total_delta_norm = float(np.sqrt(total_delta_sq))
+              total_grad_norm = float(np.sqrt(total_grad_sq))
+              total_cosine = float(
+                  -total_dot / (total_delta_norm * total_grad_norm)
+              )
+              print(
+                  "UPDATE_DIRECTION path={} step={} total_delta_norm={:.17g} "
+                  "total_used_grad_norm={:.17g} delta_dot_grad={:.17g} "
+                  "descent_cosine={:.17g} unchanged_count={} "
+                  "descent_aligned={}".format(
+                      path_name,
+                      step,
+                      total_delta_norm,
+                      total_grad_norm,
+                      total_dot,
+                      total_cosine,
+                      total_unchanged,
+                      bool(total_dot < 0.0),
+                  )
+              )
+              assert total_delta_norm > 0.0
+              assert total_dot < 0.0
+              assert total_unchanged == 0
+              return group_stats
+
+          def cumulative_summary(path_name, groups, flat, initial, final):
+              offset = 0
+              for group_name, params in groups:
+                  squared_norm = 0.0
+                  unchanged = 0
+                  for group_index in range(len(params)):
+                      delta = (
+                          final[offset].astype("float64")
+                          - initial[offset].astype("float64")
+                      )
+                      squared_norm += float(np.sum(delta * delta))
+                      unchanged += int(np.array_equal(final[offset], initial[offset]))
+                      offset += 1
+                  print(
+                      "UPDATE_CUMULATIVE path={} group={} count={} "
+                      "delta_norm={:.17g} unchanged_count={}".format(
+                          path_name,
+                          group_name,
+                          len(params),
+                          float(np.sqrt(squared_norm)),
+                          unchanged,
+                      )
+                  )
+              assert offset == len(flat)
+
+          def run_three_steps(
+              path_name,
+              model,
+              groups,
+              flat,
+              train_fn,
+              train_args,
+              monitor_fn,
+              monitor_args,
+              loss_fn,
+              loss_args,
+              prior_fn=None,
+              labels=None,
+          ):
+              initial = snapshot(flat)
+              previous_after_loss = scalar_value(loss_fn(*loss_args))
+              print(
+                  "UPDATE_INITIAL path={} loss={:.17g} parameter_count=26 "
+                  "all_parameters_finite=True".format(
+                      path_name, previous_after_loss
+                  )
+              )
+
+              for step in range(1, 4):
+                  monitor_values = monitor_fn(*monitor_args)
+                  loss_before = scalar_value(monitor_values[0])
+                  gradients = monitor_values[1:27]
+                  used_grad_norm = scalar_value(monitor_values[27])
+                  raw_grad_norm = scalar_value(monitor_values[28])
+                  before = snapshot(flat)
+
+                  train_output = train_fn(*train_args)
+                  if path_name == "labeled":
+                      returned_loss = scalar_value(train_output[0])
+                  else:
+                      returned_loss = scalar_value(train_output)
+
+                  after = snapshot(flat)
+                  loss_after = scalar_value(loss_fn(*loss_args))
+                  assert np.allclose(
+                      loss_before, returned_loss, rtol=0.0, atol=1e-7
+                  )
+                  assert np.allclose(
+                      loss_before, previous_after_loss, rtol=0.0, atol=1e-7
+                  )
+
+                  print(
+                      "UPDATE_STEP path={} step={} loss_before={:.17g} "
+                      "train_returned_loss={:.17g} loss_after={:.17g} "
+                      "loss_delta={:.17g} decreased={} used_grad_norm={:.17g} "
+                      "raw_grad_norm={:.17g} loss_finite=True".format(
+                          path_name,
+                          step,
+                          loss_before,
+                          returned_loss,
+                          loss_after,
+                          loss_after - loss_before,
+                          bool(loss_after < loss_before),
+                          used_grad_norm,
+                          raw_grad_norm,
+                      )
+                  )
+                  analyze_step(
+                      path_name, step, flat, before, after, gradients
+                  )
+
+                  all_parameter_values = snapshot(flat)
+                  assert all([
+                      np.isfinite(value).all()
+                      for value in all_parameter_values
+                  ])
+
+                  if prior_fn is not None:
+                      prior_values = prior_fn(labels, training_mode)
+                      for class_index in range(2):
+                          mu = np.asarray(prior_values[class_index * 2])
+                          var = np.asarray(prior_values[class_index * 2 + 1])
+                          selected = labels[:, class_index] == 1.0
+                          selected_zero_count = int(np.sum(mu[selected] == 0))
+                          finite = bool(
+                              np.isfinite(mu).all()
+                              and np.isfinite(var).all()
+                          )
+                          positive_var = bool(np.all(var > 0))
+                          print(
+                              "NONZERO_AFTER_UPDATE step={} class={} "
+                              "selected_mu_exact_zero_count={}/{} "
+                              "finite={} positive_var={}".format(
+                                  step,
+                                  class_index,
+                                  selected_zero_count,
+                                  int(mu[selected].size),
+                                  finite,
+                                  positive_var,
+                              )
+                          )
+                          assert selected_zero_count == 0
+                          assert finite
+                          assert positive_var
+
+                  previous_after_loss = loss_after
+
+              final = snapshot(flat)
+              cumulative_summary(
+                  path_name, groups, flat, initial, final
+              )
+              print(
+                  "UPDATE_SUMMARY path={} steps=3 final_loss={:.17g} "
+                  "total_loss_delta={:.17g} stochastic_training_mode=False "
+                  "all_parameters_updated=True all_finite=True".format(
+                      path_name,
+                      previous_after_loss,
+                      previous_after_loss - scalar_value(
+                          loss_fn(*loss_args)
+                      ) + 0.0,
+                  )
+              )
+
+          print("ENV Theano={} NumPy={} device={} floatX={}".format(
+              theano.__version__,
+              np.__version__,
+              theano.config.device,
+              theano.config.floatX,
+          ))
+          assert theano.config.device == "cpu"
+          assert theano.config.floatX == "float32"
+
+          args = make_args()
+          rng = np.random.RandomState(106)
+          x = (0.25 * rng.normal(size=(args.batch_size, 6))).astype("float32")
+          eps = rng.normal(size=(args.batch_size, args.zdim)).astype("float32")
+          labels = np.eye(args.num_k, dtype="float32")[
+              np.asarray([0, 1, 0, 1], dtype="int32")
+          ]
+          training_mode = np.asarray(0.0, dtype="float32")
+
+          for input_name, input_value in [
+              ("x", x),
+              ("eps", eps),
+              ("labels", labels),
+              ("training_mode", training_mode),
+          ]:
+              array = np.asarray(input_value)
+              print("INPUT {} shape={} dtype={}".format(
+                  input_name, array.shape, array.dtype
+              ))
+              assert array.dtype == np.dtype("float32")
+
+          print(
+              "RANDOMNESS dropout_rate={} training_mode={} "
+              "dropout_sampling_active=False fixed_inputs=True fixed_epsilon=True".format(
+                  args.dropout_rate, float(training_mode)
+              )
+          )
+
+          labeled_model = make_model()
+          labeled_groups, labeled_flat = parameter_groups(labeled_model)
+          labeled_x_shared = theano.shared(x, borrow=True)
+          labeled_y_shared = theano.shared(labels, borrow=True)
+          labeled_train_fn = labeled_model.labeled_training(
+              labeled_x_shared,
+              labeled_y_shared,
+              args.batch_size,
+          )
+          inspect_updates(
+              "labeled",
+              labeled_model,
+              labeled_model.updates_l,
+              labeled_model.optimizer_l.lr,
+          )
+          labeled_used_norm = T.sqrt(sum([
+              T.sum(T.square(gradient))
+              for gradient in labeled_model.gparams_l
+          ]))
+          labeled_monitor_fn = theano.function(
+              inputs=[
+                  labeled_model.x,
+                  labeled_model.eps,
+                  labeled_model.labels,
+                  labeled_model.y_in_enc,
+                  labeled_model.y_in_gmm,
+                  labeled_model.training_mode,
+              ],
+              outputs=(
+                  [labeled_model.labeled_cost]
+                  + labeled_model.gparams_l
+                  + [labeled_used_norm, labeled_used_norm]
+              ),
+              no_default_updates=True,
+          )
+          labeled_loss_fn = theano.function(
+              inputs=[
+                  labeled_model.x,
+                  labeled_model.eps,
+                  labeled_model.labels,
+                  labeled_model.y_in_enc,
+                  labeled_model.y_in_gmm,
+                  labeled_model.training_mode,
+              ],
+              outputs=labeled_model.labeled_cost,
+              no_default_updates=True,
+          )
+          prior_outputs = []
+          for prior_model in labeled_model.all_gmm:
+              prior_outputs.extend([prior_model.mu, prior_model.var])
+          labeled_prior_fn = theano.function(
+              inputs=[
+                  labeled_model.y_in_gmm,
+                  labeled_model.training_mode,
+              ],
+              outputs=prior_outputs,
+              no_default_updates=True,
+              on_unused_input="ignore",
+          )
+          run_three_steps(
+              "labeled",
+              labeled_model,
+              labeled_groups,
+              labeled_flat,
+              labeled_train_fn,
+              (0, eps, training_mode),
+              labeled_monitor_fn,
+              (x, eps, labels, labels, labels, training_mode),
+              labeled_loss_fn,
+              (x, eps, labels, labels, labels, training_mode),
+              prior_fn=labeled_prior_fn,
+              labels=labels,
+          )
+
+          unlabeled_model = make_model()
+          unlabeled_groups, unlabeled_flat = parameter_groups(unlabeled_model)
+          unlabeled_x_shared = theano.shared(x, borrow=True)
+          unlabeled_train_fn = unlabeled_model.unlabeled_training(
+              unlabeled_x_shared,
+              args.batch_size,
+          )
+          inspect_updates(
+              "unlabeled",
+              unlabeled_model,
+              unlabeled_model.updates_u,
+              unlabeled_model.optimizer_u.lr,
+          )
+          unlabeled_raw_gradients = [
+              T.grad(unlabeled_model.unlabeled_cost, parameter)
+              for parameter in unlabeled_model.params
+          ]
+          unlabeled_used_norm = T.sqrt(sum([
+              T.sum(T.square(gradient))
+              for gradient in unlabeled_model.gparams_u
+          ]))
+          unlabeled_raw_norm = T.sqrt(sum([
+              T.sum(T.square(gradient))
+              for gradient in unlabeled_raw_gradients
+          ]))
+          unlabeled_monitor_fn = theano.function(
+              inputs=[
+                  unlabeled_model.x,
+                  unlabeled_model.eps,
+                  unlabeled_model.training_mode,
+              ],
+              outputs=(
+                  [unlabeled_model.unlabeled_cost]
+                  + unlabeled_model.gparams_u
+                  + [unlabeled_used_norm, unlabeled_raw_norm]
+              ),
+              no_default_updates=True,
+          )
+          unlabeled_loss_fn = theano.function(
+              inputs=[
+                  unlabeled_model.x,
+                  unlabeled_model.eps,
+                  unlabeled_model.training_mode,
+              ],
+              outputs=unlabeled_model.unlabeled_cost,
+              no_default_updates=True,
+          )
+          run_three_steps(
+              "unlabeled",
+              unlabeled_model,
+              unlabeled_groups,
+              unlabeled_flat,
+              unlabeled_train_fn,
+              (0, eps, training_mode),
+              unlabeled_monitor_fn,
+              (x, eps, training_mode),
+              unlabeled_loss_fn,
+              (x, eps, training_mode),
+          )
+
+          print("RESULT both original Adam update paths executed exactly three steps")
+          print("RESULT all 26 parameters were targeted and changed on every step")
+          print("RESULT losses and parameters remained finite")
+          print("CAUTION synthetic loss behavior is not a paper-result reproduction")
+          PYTHON_CHECK
+          CONTAINER_SCRIPT
