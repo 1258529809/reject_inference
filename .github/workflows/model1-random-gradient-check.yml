@@ -1,0 +1,461 @@
+name: Model 1 random gradient check
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - codex/model1-cpu-env-check
+    paths:
+      - .github/workflows/model1-random-gradient-check.yml
+
+permissions:
+  contents: read
+
+jobs:
+  random-gradient-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+
+    steps:
+      - name: Sparse checkout Model 1 source only
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+          sparse-checkout: |
+            python/model1
+          sparse-checkout-cone-mode: false
+
+      - name: Verify isolated checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -d python/model1
+          test ! -e data
+          test ! -e output
+          echo "workflow_commit=$(git rev-parse HEAD)"
+          sha256sum python/model1/SS_M1.py python/model1/dropout_layers.py python/model1/utils.py
+
+      - name: Pull pinned author image
+        shell: bash
+        env:
+          IMAGE: rogelioandrade/theano_setup@sha256:69c334b33ae5df566d8f17363428bb5a7030743f7bcc7ba27ab29e616f7b848f
+        run: |
+          set -euo pipefail
+          docker pull "${IMAGE}"
+
+      - name: Build and evaluate grouped gradients
+        shell: bash
+        env:
+          IMAGE: rogelioandrade/theano_setup@sha256:69c334b33ae5df566d8f17363428bb5a7030743f7bcc7ba27ab29e616f7b848f
+        run: |
+          set -euo pipefail
+          docker run --rm -i \
+            --network none \
+            --cpus 2 \
+            --memory 8g \
+            --pids-limit 512 \
+            --security-opt=no-new-privileges:true \
+            --read-only \
+            --tmpfs /tmp:rw,exec,nosuid,size=1g \
+            -e HOME=/tmp \
+            -e PYTHONDONTWRITEBYTECODE=1 \
+            -e OMP_NUM_THREADS=2 \
+            -e THEANO_FLAGS=device=cpu,floatX=float32,base_compiledir=/tmp/theano \
+            -v "${GITHUB_WORKSPACE}/python/model1:/work/model1:ro" \
+            -w /work/model1 \
+            "${IMAGE}" /bin/bash -s <<'CONTAINER_SCRIPT'
+          set -eu
+          test ! -e /work/data
+          test ! -e /work/output
+          test ! -e /work/model1/data
+          test ! -e /work/model1/output
+
+          python - <<'PYTHON_CHECK'
+          import time
+          import numpy as np
+          import theano
+          import theano.tensor as T
+
+          from SS_M1 import SS_M1
+
+          class Args(object):
+              pass
+
+          def make_args():
+              args = Args()
+              args.lr_u = 0.0001
+              args.lr_l = 0.0001
+              args.batch_size = 4
+              args.hdim_cls = [5]
+              args.hdim_enc = [5]
+              args.hdim_dec = [5]
+              args.hdim_gmm = [5]
+              args.zdim = 3
+              args.dec = "gaussian"
+              args.num_k = 2
+              args.nlayers_enc = 1
+              args.nlayers_dec = 1
+              args.nlayers_cls = 1
+              args.nlayers_gmm = 1
+              args.dropout_rate = 0.01
+              args.hl_activation = "softplus"
+              return args
+
+          def make_model():
+              return SS_M1(
+                  xdim=6,
+                  num_classes=2,
+                  alpha=1.1,
+                  args=make_args(),
+                  enc_weights=None,
+                  dec_weights=None,
+                  cls_weights=None,
+                  gmm_weights=None,
+              )
+
+          PARAMETER_NAMES = {
+              "classifier": ["hidden_W", "hidden_b", "softmax_W", "softmax_b"],
+              "encoder": [
+                  "hidden_W", "hidden_b", "mu_W", "mu_b", "logvar_W", "logvar_b"
+              ],
+              "decoder": [
+                  "hidden_W", "hidden_b", "mu_W", "mu_b", "logvar_W", "logvar_b"
+              ],
+              "conditional_prior": [
+                  "shared_hidden_W", "shared_hidden_b",
+                  "class0_mu_W", "class0_mu_b", "class0_logvar_W", "class0_logvar_b",
+                  "class1_mu_W", "class1_mu_b", "class1_logvar_W", "class1_logvar_b",
+              ],
+          }
+
+          def parameter_groups(model):
+              groups = [
+                  ("classifier", list(model.cls_mlp.params)),
+                  ("encoder", list(model.enc_mlp.params)),
+                  ("decoder", list(model.dec_mlp.params)),
+                  ("conditional_prior", list(model.gmm_weights)),
+              ]
+              expected_counts = {
+                  "classifier": 4,
+                  "encoder": 6,
+                  "decoder": 6,
+                  "conditional_prior": 10,
+              }
+              flat = []
+              for group_name, params in groups:
+                  assert len(params) == expected_counts[group_name]
+                  assert len(params) == len(PARAMETER_NAMES[group_name])
+                  print("PARAM_GROUP {} count={} theoretical_participation=expected".format(
+                      group_name, len(params)
+                  ))
+                  for index, param in enumerate(params):
+                      flat.append((
+                          group_name,
+                          PARAMETER_NAMES[group_name][index],
+                          param,
+                      ))
+              assert len(flat) == 26
+              assert len(set([id(item[2]) for item in flat])) == 26
+              assert sorted([id(p) for p in model.params]) == sorted(
+                  [id(item[2]) for item in flat]
+              )
+              return groups, flat
+
+          def build_strict_gradients(loss_name, cost, flat):
+              gradients = []
+              for group_name, parameter_name, parameter in flat:
+                  try:
+                      gradient = T.grad(cost, parameter)
+                  except Exception as exc:
+                      print("GRAD_BUILD_ERROR loss={} group={} parameter={} error_type={} error={!r}".format(
+                          loss_name,
+                          group_name,
+                          parameter_name,
+                          type(exc).__name__,
+                          exc,
+                      ))
+                      raise
+                  gradients.append(gradient)
+              print("{} strict_gradient_construction=OK count={}".format(
+                  loss_name, len(gradients)
+              ))
+              return gradients
+
+          def analyze_gradients(loss_name, groups, flat, values):
+              offset = 0
+              total_zero = 0
+              total_disconnected = 0
+              for group_name, params in groups:
+                  squared_norm = 0.0
+                  group_zero = 0
+                  group_finite = True
+                  print("GRAD_GROUP_BEGIN loss={} group={} count={}".format(
+                      loss_name, group_name, len(params)
+                  ))
+                  for group_index in range(len(params)):
+                      parameter_name = PARAMETER_NAMES[group_name][group_index]
+                      parameter_value = params[group_index].get_value(borrow=True)
+                      gradient_value = np.asarray(values[offset])
+                      offset += 1
+                      assert gradient_value.shape == parameter_value.shape
+                      finite = bool(np.isfinite(gradient_value).all())
+                      zero = bool(np.all(gradient_value == 0))
+                      norm = float(np.sqrt(np.sum(
+                          np.square(gradient_value.astype("float64"))
+                      )))
+                      squared_norm += norm * norm
+                      group_finite = group_finite and finite
+                      group_zero += int(zero)
+                      total_zero += int(zero)
+                      print(
+                          "GRAD loss={} group={} index={} parameter={} "
+                          "shape={} param_dtype={} grad_dtype={} norm={:.17g} "
+                          "finite={} zero={} disconnected=False".format(
+                              loss_name,
+                              group_name,
+                              group_index,
+                              parameter_name,
+                              gradient_value.shape,
+                              parameter_value.dtype,
+                              gradient_value.dtype,
+                              norm,
+                              finite,
+                              zero,
+                          )
+                      )
+                      assert finite
+                  print(
+                      "GRAD_GROUP_END loss={} group={} count={} group_norm={:.17g} "
+                      "finite={} zero_count={} disconnected_count=0".format(
+                          loss_name,
+                          group_name,
+                          len(params),
+                          float(np.sqrt(squared_norm)),
+                          group_finite,
+                          group_zero,
+                      )
+                  )
+              assert offset == len(values)
+              print(
+                  "GRAD_SUMMARY loss={} parameter_count={} zero_count={} "
+                  "disconnected_count={} all_finite=True".format(
+                      loss_name, len(flat), total_zero, total_disconnected
+                  )
+              )
+
+          print("ENV Theano={} NumPy={} device={} floatX={}".format(
+              theano.__version__,
+              np.__version__,
+              theano.config.device,
+              theano.config.floatX,
+          ))
+          assert theano.config.device == "cpu"
+          assert theano.config.floatX == "float32"
+
+          args = make_args()
+          rng = np.random.RandomState(105)
+          x = (0.25 * rng.normal(size=(args.batch_size, 6))).astype("float32")
+          eps = rng.normal(size=(args.batch_size, args.zdim)).astype("float32")
+          labels = np.eye(args.num_k, dtype="float32")[
+              np.asarray([0, 1, 0, 1], dtype="int32")
+          ]
+          training_mode = np.asarray(0.0, dtype="float32")
+
+          for input_name, input_value in [
+              ("x", x),
+              ("eps", eps),
+              ("labels", labels),
+              ("y_in_enc", labels),
+              ("y_in_gmm", labels),
+              ("training_mode", training_mode),
+          ]:
+              array = np.asarray(input_value)
+              print("INPUT {} shape={} dtype={}".format(
+                  input_name, array.shape, array.dtype
+              ))
+              assert array.dtype == np.dtype("float32")
+
+          labeled_model = make_model()
+          labeled_groups, labeled_flat = parameter_groups(labeled_model)
+          labeled_model.labeled_cost()
+          print("LOSS labeled_cost symbolic_shape=() dtype={}".format(
+              labeled_model.labeled_cost.dtype
+          ))
+          labeled_gradients = build_strict_gradients(
+              "labeled_cost", labeled_model.labeled_cost, labeled_flat
+          )
+
+          prior_output_gradients = []
+          prior_outputs = []
+          for class_index, prior_model in enumerate(labeled_model.all_gmm):
+              try:
+                  grad_mu = T.grad(labeled_model.labeled_cost, prior_model.mu)
+                  grad_var = T.grad(labeled_model.labeled_cost, prior_model.var)
+              except Exception as exc:
+                  print(
+                      "NONZERO_PATH_GRAD_BUILD_ERROR class={} error_type={} error={!r}".format(
+                          class_index, type(exc).__name__, exc
+                      )
+                  )
+                  raise
+              prior_outputs.extend([prior_model.mu, prior_model.var])
+              prior_output_gradients.extend([grad_mu, grad_var])
+          print("NONZERO_PATH strict_output_gradient_construction=OK tensors={}".format(
+              len(prior_output_gradients)
+          ))
+
+          compile_start = time.time()
+          labeled_fn = theano.function(
+              inputs=[
+                  labeled_model.x,
+                  labeled_model.eps,
+                  labeled_model.labels,
+                  labeled_model.y_in_enc,
+                  labeled_model.y_in_gmm,
+                  labeled_model.training_mode,
+              ],
+              outputs=(
+                  [labeled_model.labeled_cost]
+                  + labeled_gradients
+                  + prior_outputs
+                  + prior_output_gradients
+              ),
+              no_default_updates=True,
+          )
+          print("COMPILE labeled_cost seconds={:.3f}".format(
+              time.time() - compile_start
+          ))
+          labeled_values = labeled_fn(
+              x, eps, labels, labels, labels, training_mode
+          )
+          labeled_loss_value = np.asarray(labeled_values[0])
+          print("LOSS_VALUE labeled_cost value={!r} shape={} dtype={} finite={}".format(
+              float(labeled_loss_value),
+              labeled_loss_value.shape,
+              labeled_loss_value.dtype,
+              bool(np.isfinite(labeled_loss_value).all()),
+          ))
+          assert labeled_loss_value.shape == ()
+          assert np.isfinite(labeled_loss_value).all()
+          analyze_gradients(
+              "labeled_cost",
+              labeled_groups,
+              labeled_flat,
+              labeled_values[1:1 + len(labeled_gradients)],
+          )
+
+          probe_offset = 1 + len(labeled_gradients)
+          evaluated_prior_outputs = labeled_values[
+              probe_offset:probe_offset + len(prior_outputs)
+          ]
+          evaluated_prior_grads = labeled_values[
+              probe_offset + len(prior_outputs):
+          ]
+          for class_index in range(args.num_k):
+              mu = np.asarray(evaluated_prior_outputs[class_index * 2])
+              var = np.asarray(evaluated_prior_outputs[class_index * 2 + 1])
+              grad_mu = np.asarray(evaluated_prior_grads[class_index * 2])
+              grad_var = np.asarray(evaluated_prior_grads[class_index * 2 + 1])
+              selected = labels[:, class_index] == 1.0
+              unselected = np.logical_not(selected)
+              selected_mu_zero_count = int(np.sum(mu[selected] == 0))
+              selected_mu_count = int(mu[selected].size)
+              mu_row_norms = np.sqrt(np.sum(
+                  np.square(grad_mu.astype("float64")), axis=1
+              ))
+              var_row_norms = np.sqrt(np.sum(
+                  np.square(grad_var.astype("float64")), axis=1
+              ))
+              finite = bool(
+                  np.isfinite(mu).all()
+                  and np.isfinite(var).all()
+                  and np.isfinite(grad_mu).all()
+                  and np.isfinite(grad_var).all()
+              )
+              unselected_mu_zero = bool(np.all(grad_mu[unselected] == 0))
+              unselected_var_zero = bool(np.all(grad_var[unselected] == 0))
+              print(
+                  "NONZERO_PATH class={} mu_shape={} var_shape={} "
+                  "grad_mu_shape={} grad_var_shape={} grad_mu_dtype={} "
+                  "grad_var_dtype={} selected_mu_exact_zero_count={}/{} "
+                  "mu_row_norms={} var_row_norms={} "
+                  "unselected_mu_grad_zero={} unselected_var_grad_zero={} "
+                  "finite={}".format(
+                      class_index,
+                      mu.shape,
+                      var.shape,
+                      grad_mu.shape,
+                      grad_var.shape,
+                      grad_mu.dtype,
+                      grad_var.dtype,
+                      selected_mu_zero_count,
+                      selected_mu_count,
+                      mu_row_norms.tolist(),
+                      var_row_norms.tolist(),
+                      unselected_mu_zero,
+                      unselected_var_zero,
+                      finite,
+                  )
+              )
+              assert mu.shape == (args.batch_size, args.zdim)
+              assert var.shape == (args.batch_size, args.zdim)
+              assert grad_mu.shape == mu.shape
+              assert grad_var.shape == var.shape
+              assert selected_mu_zero_count == 0
+              assert unselected_mu_zero
+              assert unselected_var_zero
+              assert finite
+
+          assert not hasattr(labeled_model, "optimizer_l")
+          assert not hasattr(labeled_model, "updates_l")
+
+          unlabeled_model = make_model()
+          unlabeled_groups, unlabeled_flat = parameter_groups(unlabeled_model)
+          unlabeled_model.unlabeled_cost()
+          print("LOSS unlabeled_cost symbolic_shape=() dtype={}".format(
+              unlabeled_model.unlabeled_cost.dtype
+          ))
+          unlabeled_gradients = build_strict_gradients(
+              "unlabeled_cost", unlabeled_model.unlabeled_cost, unlabeled_flat
+          )
+
+          compile_start = time.time()
+          unlabeled_fn = theano.function(
+              inputs=[
+                  unlabeled_model.x,
+                  unlabeled_model.eps,
+                  unlabeled_model.training_mode,
+              ],
+              outputs=[unlabeled_model.unlabeled_cost] + unlabeled_gradients,
+              no_default_updates=True,
+          )
+          print("COMPILE unlabeled_cost seconds={:.3f}".format(
+              time.time() - compile_start
+          ))
+          unlabeled_values = unlabeled_fn(x, eps, training_mode)
+          unlabeled_loss_value = np.asarray(unlabeled_values[0])
+          print("LOSS_VALUE unlabeled_cost value={!r} shape={} dtype={} finite={}".format(
+              float(unlabeled_loss_value),
+              unlabeled_loss_value.shape,
+              unlabeled_loss_value.dtype,
+              bool(np.isfinite(unlabeled_loss_value).all()),
+          ))
+          assert unlabeled_loss_value.shape == ()
+          assert np.isfinite(unlabeled_loss_value).all()
+          analyze_gradients(
+              "unlabeled_cost",
+              unlabeled_groups,
+              unlabeled_flat,
+              unlabeled_values[1:],
+          )
+
+          assert not hasattr(unlabeled_model, "optimizer_u")
+          assert not hasattr(unlabeled_model, "updates_u")
+
+          print("RESULT both strict 26-parameter gradient graphs compiled and evaluated")
+          print("RESULT all evaluated parameter gradients have matching shapes and finite values")
+          print("RESULT no optimizer, parameter update, training call, data, or weights were used")
+          print("CAUTION finite gradients do not establish mathematical correctness")
+          PYTHON_CHECK
+          CONTAINER_SCRIPT
