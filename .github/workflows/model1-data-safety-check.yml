@@ -377,7 +377,7 @@ jobs:
           args.nlayers_dec = 1
           args.nlayers_cls = 1
           args.nlayers_gmm = 1
-          args.dropout_rate = 0.0
+          args.dropout_rate = 0.01
           args.hl_activation = 'softplus'
 
           alpha_initial = 12.084761597938146
