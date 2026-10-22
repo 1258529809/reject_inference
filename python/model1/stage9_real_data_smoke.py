@@ -5,7 +5,7 @@ import os
 import random
 import traceback
 
-import cPickle as pickle
+import pickle
 import numpy as np
 import theano
 import theano.tensor as T
