@@ -98,7 +98,7 @@ jobs:
               args.nlayers_dec = 1
               args.nlayers_cls = 1
               args.nlayers_gmm = 1
-              args.dropout_rate = 0.0
+              args.dropout_rate = 0.01
               args.hl_activation = "softplus"
               return args
 
