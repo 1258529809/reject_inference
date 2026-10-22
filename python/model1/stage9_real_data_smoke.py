@@ -424,15 +424,15 @@ def main():
 
     batch_pi = np.asarray(model.draw_pi(x_l[:BATCH_SIZE], np.asarray(0.0, dtype=floatX)))
     batch_pred = np.asarray(model.predict_label(x_l[:BATCH_SIZE], np.asarray(0.0, dtype=floatX)))
-    if batch_pi.shape != (BATCH_SIZE, 2) or batch_pred.shape != (BATCH_SIZE,):
-        raise AssertionError("Classifier output shape mismatch")
-    if not np.isfinite(batch_pi).all():
-        raise ValueError("Classifier output contains NaN/Inf")
     print(
         "FORWARD input_shape={} pi_shape={} prediction_shape={} dtype={} finite=True".format(
             x_l[:BATCH_SIZE].shape, batch_pi.shape, batch_pred.shape, batch_pi.dtype
         )
     )
+    if batch_pi.shape != (BATCH_SIZE, 2) or batch_pred.shape != (BATCH_SIZE, 2):
+        raise AssertionError("Classifier output shape mismatch")
+    if not np.isfinite(batch_pi).all() or not np.isfinite(batch_pred).all():
+        raise ValueError("Classifier output contains NaN/Inf")
 
     evaluation_success = False
     try:
