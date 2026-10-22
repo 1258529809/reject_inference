@@ -1,0 +1,239 @@
+name: Model 1 random loss check
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - codex/model1-cpu-env-check
+    paths:
+      - .github/workflows/model1-random-loss-check.yml
+
+permissions:
+  contents: read
+
+jobs:
+  random-loss-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Sparse checkout Model 1 source only
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+          sparse-checkout: |
+            python/model1
+          sparse-checkout-cone-mode: false
+
+      - name: Verify isolated checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -d python/model1
+          test ! -e data
+          test ! -e output
+          echo "workflow_commit=$(git rev-parse HEAD)"
+          sha256sum python/model1/SS_M1.py python/model1/dropout_layers.py python/model1/utils.py
+
+      - name: Pull pinned author image
+        shell: bash
+        env:
+          IMAGE: rogelioandrade/theano_setup@sha256:69c334b33ae5df566d8f17363428bb5a7030743f7bcc7ba27ab29e616f7b848f
+        run: |
+          set -euo pipefail
+          docker pull "${IMAGE}"
+
+      - name: Build and evaluate labeled and unlabeled losses
+        shell: bash
+        env:
+          IMAGE: rogelioandrade/theano_setup@sha256:69c334b33ae5df566d8f17363428bb5a7030743f7bcc7ba27ab29e616f7b848f
+        run: |
+          set -euo pipefail
+          docker run --rm -i \
+            --network none \
+            --cpus 2 \
+            --memory 8g \
+            --pids-limit 512 \
+            --security-opt=no-new-privileges:true \
+            --read-only \
+            --tmpfs /tmp:rw,exec,nosuid,size=1g \
+            -e HOME=/tmp \
+            -e PYTHONDONTWRITEBYTECODE=1 \
+            -e OMP_NUM_THREADS=2 \
+            -e THEANO_FLAGS=device=cpu,floatX=float32,base_compiledir=/tmp/theano \
+            -v "${GITHUB_WORKSPACE}/python/model1:/work/model1:ro" \
+            -w /work/model1 \
+            "${IMAGE}" /bin/bash -s <<'CONTAINER_SCRIPT'
+          set -eu
+          test ! -e /work/data
+          test ! -e /work/output
+          test ! -e /work/model1/data
+          test ! -e /work/model1/output
+
+          python - <<'PYTHON_CHECK'
+          import time
+          import numpy as np
+          import theano
+          import theano.tensor as T
+
+          from SS_M1 import SS_M1
+
+          class Args(object):
+              pass
+
+          def make_args():
+              args = Args()
+              args.lr_u = 0.0001
+              args.lr_l = 0.0001
+              args.batch_size = 4
+              args.hdim_cls = [5]
+              args.hdim_enc = [5]
+              args.hdim_dec = [5]
+              args.hdim_gmm = [5]
+              args.zdim = 3
+              args.dec = "gaussian"
+              args.num_k = 2
+              args.nlayers_enc = 1
+              args.nlayers_dec = 1
+              args.nlayers_cls = 1
+              args.nlayers_gmm = 1
+              args.dropout_rate = 0.0
+              args.hl_activation = "softplus"
+              return args
+
+          def make_model():
+              return SS_M1(
+                  xdim=6,
+                  num_classes=2,
+                  alpha=1.1,
+                  args=make_args(),
+                  enc_weights=None,
+                  dec_weights=None,
+                  cls_weights=None,
+                  gmm_weights=None,
+              )
+
+          def checked_scalar(name, value):
+              array = np.asarray(value)
+              print("{}: value={!r}, shape={}, dtype={}, finite={}".format(
+                  name, float(array), array.shape, array.dtype, bool(np.isfinite(array).all())
+              ))
+              assert array.shape == ()
+              assert array.dtype == np.dtype("float32")
+              assert np.isfinite(array).all()
+              return array
+
+          print("Python/Theano environment: Theano={}, NumPy={}, floatX={}".format(
+              theano.__version__, np.__version__, theano.config.floatX
+          ))
+          assert theano.config.device == "cpu"
+          assert theano.config.floatX == "float32"
+
+          args = make_args()
+          rng = np.random.RandomState(47)
+          x = (0.25 * rng.normal(size=(args.batch_size, 6))).astype("float32")
+          eps_a = rng.normal(size=(args.batch_size, args.zdim)).astype("float32")
+          eps_b = rng.normal(size=(args.batch_size, args.zdim)).astype("float32")
+          labels = np.eye(args.num_k, dtype="float32")[
+              np.asarray([0, 1, 0, 1], dtype="int32")
+          ]
+          training_mode = np.asarray(0.0, dtype="float32")
+
+          for name, value in [
+              ("x", x),
+              ("eps_a", eps_a),
+              ("eps_b", eps_b),
+              ("labels", labels),
+              ("y_in_enc", labels),
+              ("y_in_gmm", labels),
+              ("training_mode", training_mode),
+          ]:
+              array = np.asarray(value)
+              print("input {}: shape={}, dtype={}".format(name, array.shape, array.dtype))
+              assert array.dtype == np.dtype("float32")
+
+          labeled_model = make_model()
+          labeled_model.labeled_cost()
+          assert labeled_model.labeled_cost.ndim == 0
+          assert labeled_model.labeled_cost.dtype == "float32"
+          assert not hasattr(labeled_model, "optimizer_l")
+          assert not hasattr(labeled_model, "updates_l")
+
+          compile_start = time.time()
+          labeled_fn = theano.function(
+              inputs=[
+                  labeled_model.x,
+                  labeled_model.eps,
+                  labeled_model.labels,
+                  labeled_model.y_in_enc,
+                  labeled_model.y_in_gmm,
+                  labeled_model.training_mode,
+              ],
+              outputs=[
+                  labeled_model.labeled_cost,
+                  labeled_model.cls_cost,
+                  T.mean(labeled_model.dec_mlp.cost),
+              ],
+              no_default_updates=True,
+          )
+          print("labeled_cost compilation_seconds={:.3f}".format(time.time() - compile_start))
+
+          labeled_a = labeled_fn(x, eps_a, labels, labels, labels, training_mode)
+          labeled_repeat = labeled_fn(x, eps_a, labels, labels, labels, training_mode)
+          labeled_b = labeled_fn(x, eps_b, labels, labels, labels, training_mode)
+
+          labeled_a_total = checked_scalar("labeled_cost[eps_a]", labeled_a[0])
+          checked_scalar("labeled_classifier_term[eps_a]", labeled_a[1])
+          checked_scalar("labeled_decoder_nll_mean[eps_a]", labeled_a[2])
+          labeled_repeat_total = checked_scalar("labeled_cost[eps_a_repeat]", labeled_repeat[0])
+          labeled_b_total = checked_scalar("labeled_cost[eps_b]", labeled_b[0])
+          assert np.allclose(labeled_a_total, labeled_repeat_total, rtol=0.0, atol=1e-7)
+          print("labeled_fixed_epsilon_repeat_equal=True")
+          print("labeled_alternate_epsilon_abs_delta={!r}".format(
+              float(np.abs(labeled_b_total - labeled_a_total))
+          ))
+
+          unlabeled_model = make_model()
+          unlabeled_model.unlabeled_cost()
+          assert unlabeled_model.unlabeled_cost.ndim == 0
+          assert unlabeled_model.unlabeled_cost.dtype == "float32"
+          assert not hasattr(unlabeled_model, "optimizer_u")
+          assert not hasattr(unlabeled_model, "updates_u")
+
+          compile_start = time.time()
+          unlabeled_fn = theano.function(
+              inputs=[
+                  unlabeled_model.x,
+                  unlabeled_model.eps,
+                  unlabeled_model.training_mode,
+              ],
+              outputs=unlabeled_model.unlabeled_cost,
+              no_default_updates=True,
+          )
+          print("unlabeled_cost compilation_seconds={:.3f}".format(time.time() - compile_start))
+
+          unlabeled_a = checked_scalar(
+              "unlabeled_cost[eps_a]",
+              unlabeled_fn(x, eps_a, training_mode),
+          )
+          unlabeled_repeat = checked_scalar(
+              "unlabeled_cost[eps_a_repeat]",
+              unlabeled_fn(x, eps_a, training_mode),
+          )
+          unlabeled_b = checked_scalar(
+              "unlabeled_cost[eps_b]",
+              unlabeled_fn(x, eps_b, training_mode),
+          )
+          assert np.allclose(unlabeled_a, unlabeled_repeat, rtol=0.0, atol=1e-7)
+          print("unlabeled_fixed_epsilon_repeat_equal=True")
+          print("unlabeled_alternate_epsilon_abs_delta={!r}".format(
+              float(np.abs(unlabeled_b - unlabeled_a))
+          ))
+
+          print("RESULT: labeled_cost and unlabeled_cost both compiled and evaluated")
+          print("RESULT: all requested scalar losses are finite float32 values")
+          print("RESULT: no optimizer or training update was created")
+          print("RESULT: no data or pretrained parameters were mounted or deserialized")
+          PYTHON_CHECK
+          CONTAINER_SCRIPT
