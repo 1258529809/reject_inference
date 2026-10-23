@@ -1,0 +1,227 @@
+name: Model 1 real-data one-epoch training check
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - codex/model1-cpu-env-check
+    paths:
+      - .github/workflows/model1-real-data-one-epoch.yml
+      - python/model1/stage10_real_data_one_epoch.py
+
+permissions:
+  contents: read
+
+env:
+  STAGE9_SHA: 98757a3f1683c553f606340bd6fe75e85345f779
+  AUTHOR_BASELINE_SHA: 5304bec5034fcf35e04893e73b21a58696561f45
+  IMAGE: rogelioandrade/theano_setup@sha256:69c334b33ae5df566d8f17363428bb5a7030743f7bcc7ba27ab29e616f7b848f
+
+jobs:
+  real-data-one-epoch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout current Stage 10 commit with history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify baseline, author files, data identity, and output isolation
+        shell: bash
+        run: |
+          set -euo pipefail
+          git merge-base --is-ancestor "${STAGE9_SHA}" HEAD
+          test "$(git diff --name-only "${STAGE9_SHA}" HEAD | sort)" = "$(printf '%s\n' \
+            .github/workflows/model1-real-data-one-epoch.yml \
+            python/model1/stage10_real_data_one_epoch.py | sort)"
+          git diff --exit-code "${AUTHOR_BASELINE_SHA}" -- \
+            README.md \
+            data/supervised_lc_paper.pk.gz \
+            data/unsupervised_lc_paper.pk.gz \
+            python/model1/SS_M1.py \
+            python/model1/dropout_layers.py \
+            python/model1/optimizers.py \
+            python/model1/training_model1.py \
+            python/model1/utils.py
+
+          test "$(git hash-object -- data/supervised_lc_paper.pk.gz)" = \
+            63e87ab586d25f6109310eb71206267d6897c739
+          test "$(git hash-object -- data/unsupervised_lc_paper.pk.gz)" = \
+            ffe372541611db4a66504fc49186401aef642123
+          test "$(stat -c '%s' -- data/supervised_lc_paper.pk.gz)" = 854027
+          test "$(stat -c '%s' -- data/unsupervised_lc_paper.pk.gz)" = 3011684
+          printf '%s\n' \
+            '2492824dc943e67ee6777895dfa4d30caea8cce8b94d13814f7965dc9df0a187  data/supervised_lc_paper.pk.gz' \
+            'a5ef7158dd561917b09d8d714b1b7137cbc3625cd2d268a4a153f5e018620a75  data/unsupervised_lc_paper.pk.gz' \
+            | sha256sum --check --strict
+          gzip -t -- data/supervised_lc_paper.pk.gz
+          gzip -t -- data/unsupervised_lc_paper.pk.gz
+          test -f python/model1/stage9_real_data_smoke.py
+          test -f python/model1/stage10_real_data_one_epoch.py
+          test -d output
+          echo "PREFLIGHT_HEAD=$(git rev-parse HEAD)"
+          echo "PREFLIGHT_STAGE9=${STAGE9_SHA}"
+          echo "PREFLIGHT_AUTHOR_BASELINE=${AUTHOR_BASELINE_SHA}"
+          echo "PREFLIGHT_DATA_AND_AUTHOR_FILES=PASS"
+          echo "OUTPUT_POLICY=repository_output_exists_but_will_not_be_mounted"
+
+      - name: Pull pinned author image
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker pull "${IMAGE}"
+          docker image inspect "${IMAGE}" \
+            --format 'IMAGE={{index .RepoDigests 0}} ARCH={{.Architecture}} OS={{.Os}} SIZE={{.Size}}'
+
+      - name: Static pickle safety gate without object construction
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm -i \
+            --network none \
+            --user 65534:65534 \
+            --cpus 2 \
+            --memory 2g \
+            --memory-swap 2g \
+            --pids-limit 64 \
+            --cap-drop ALL \
+            --security-opt no-new-privileges:true \
+            --read-only \
+            --tmpfs /tmp:rw,noexec,nosuid,size=64m \
+            -e HOME=/tmp \
+            -e PYTHONDONTWRITEBYTECODE=1 \
+            -v "${GITHUB_WORKSPACE}/data:/data:ro" \
+            -w /tmp \
+            "${IMAGE}" /bin/bash -s <<'CONTAINER_SCRIPT'
+          set -eu
+          test "$(id -u)" != 0
+          test ! -w /data/supervised_lc_paper.pk.gz
+          test ! -w /data/unsupervised_lc_paper.pk.gz
+          python - <<'PYTHON_SCAN'
+          from __future__ import print_function
+          import collections
+          import gzip
+          import os
+          import pickletools
+
+          paths = [
+              '/data/supervised_lc_paper.pk.gz',
+              '/data/unsupervised_lc_paper.pk.gz',
+          ]
+          max_uncompressed = 512 * 1024 * 1024
+          allowed_globals = set([
+              ('numpy.core.multiarray', '_reconstruct'),
+              ('numpy', 'ndarray'),
+              ('numpy', 'dtype'),
+          ])
+          forbidden_opcodes = set([
+              'INST', 'OBJ', 'NEWOBJ', 'NEWOBJ_EX', 'STACK_GLOBAL',
+              'EXT1', 'EXT2', 'EXT4', 'PERSID', 'BINPERSID',
+          ])
+
+          def global_pair(argument):
+              parts = str(argument).replace('\n', ' ').split()
+              if len(parts) != 2:
+                  raise RuntimeError('Malformed GLOBAL argument')
+              return tuple(parts)
+
+          for path in paths:
+              total = 0
+              with gzip.open(path, 'rb') as handle:
+                  while True:
+                      chunk = handle.read(1024 * 1024)
+                      if not chunk:
+                          break
+                      total += len(chunk)
+                      if total > max_uncompressed:
+                          raise RuntimeError('Uncompressed-size ceiling exceeded')
+
+              counts = collections.Counter()
+              globals_seen = set()
+              forbidden_seen = set()
+              with gzip.open(path, 'rb') as handle:
+                  for opcode, argument, position in pickletools.genops(handle):
+                      counts[opcode.name] += 1
+                      if opcode.name == 'GLOBAL':
+                          globals_seen.add(global_pair(argument))
+                      if opcode.name in forbidden_opcodes:
+                          forbidden_seen.add(opcode.name)
+                  trailing = handle.read(1)
+
+              unexpected_globals = globals_seen - allowed_globals
+              print('STATIC_FILE={}'.format(os.path.basename(path)))
+              print('PICKLE_GLOBALS={}'.format(sorted(globals_seen)))
+              print('REDUCE_COUNT={}'.format(counts['REDUCE']))
+              print('BUILD_COUNT={}'.format(counts['BUILD']))
+              print('FORBIDDEN_OPCODES={}'.format(sorted(forbidden_seen)))
+              print('UNEXPECTED_GLOBALS={}'.format(sorted(unexpected_globals)))
+              print('TRAILING_BYTES_AFTER_STOP={}'.format(bool(trailing)))
+              if forbidden_seen or unexpected_globals or trailing:
+                  raise RuntimeError('Static pickle safety gate failed')
+              print('STATIC_GATE=PASS')
+          PYTHON_SCAN
+          CONTAINER_SCRIPT
+
+      - name: Run exactly one author-scheduled epoch on real data
+        shell: bash
+        run: |
+          set -euo pipefail
+          result_dir="${RUNNER_TEMP}/model1-stage10-results"
+          mkdir -p "${result_dir}"
+          chmod 0777 "${result_dir}"
+          docker run --rm -i \
+            --network none \
+            --user 65534:65534 \
+            --cpus 2 \
+            --memory 6g \
+            --memory-swap 6g \
+            --pids-limit 256 \
+            --cap-drop ALL \
+            --security-opt no-new-privileges:true \
+            --read-only \
+            --tmpfs /tmp:rw,noexec,nosuid,size=768m \
+            --tmpfs /theano:rw,exec,nosuid,size=1g \
+            -e HOME=/tmp \
+            -e MPLCONFIGDIR=/tmp/matplotlib \
+            -e PYTHONDONTWRITEBYTECODE=1 \
+            -e PYTHONHASHSEED=9009 \
+            -e OMP_NUM_THREADS=2 \
+            -e OPENBLAS_NUM_THREADS=2 \
+            -e MKL_NUM_THREADS=2 \
+            -e THEANO_FLAGS=device=cpu,floatX=float32,base_compiledir=/theano \
+            -v "${GITHUB_WORKSPACE}/data:/data:ro" \
+            -v "${GITHUB_WORKSPACE}/python/model1:/work/model1:ro" \
+            -v "${result_dir}:/results:rw" \
+            -w /work/model1 \
+            "${IMAGE}" python -u stage10_real_data_one_epoch.py
+
+      - name: Verify repository remained unchanged
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "$(git status --porcelain)"
+          git diff --exit-code "${AUTHOR_BASELINE_SHA}" -- \
+            data \
+            output \
+            python/model1/SS_M1.py \
+            python/model1/dropout_layers.py \
+            python/model1/optimizers.py \
+            python/model1/training_model1.py \
+            python/model1/utils.py
+          echo 'POST_RUN_AUTHOR_SOURCE_DATA_WEIGHTS_OUTPUT_UNCHANGED=PASS'
+
+      - name: Upload aggregate-only Stage 10 result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: model1-stage10-aggregate-result
+          path: ${{ runner.temp }}/model1-stage10-results/stage10-summary.txt
+          if-no-files-found: ignore
+          retention-days: 14
+
+
+
